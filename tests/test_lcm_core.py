@@ -1648,6 +1648,27 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_lifecycle_fragmentation_stats_treats_last_finalized_message_session_as_referenced(self, tmp_path):
+        db_path = tmp_path / "lifecycle-finalized-message-reference.db"
+        store = MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+        store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+        state.record_rollover(
+            "conversation",
+            old_session_id="previous-session",
+            new_session_id="current-session",
+        )
+
+        stats = state.get_fragmentation_stats()
+
+        assert stats["message_sessions_without_lifecycle_current"] == 1
+        assert stats["message_sessions_without_lifecycle_reference"] == 0
+        assert stats["node_sessions_without_lifecycle_reference"] == 0
+
+        state.close()
+
     def test_lifecycle_fragmentation_stats_reports_existing_malformed_state_db(self, tmp_path):
         db_path = tmp_path / "lifecycle-malformed-state.db"
         state_db = tmp_path / "state.db"

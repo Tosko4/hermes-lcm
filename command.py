@@ -32,7 +32,7 @@ def _has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     )
     lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
     missing_lifecycle_reference_keys = (
-        "message_sessions_without_lifecycle_current",
+        "message_sessions_without_lifecycle_reference",
         "node_sessions_without_lifecycle_reference",
     )
     return (
@@ -767,6 +767,7 @@ def _doctor_text(engine) -> str:
             f"message_sessions_missing_in_state={lifecycle_stats['lcm_message_sessions_missing_in_state']} "
             f"node_sessions_missing_in_state={lifecycle_stats['lcm_node_sessions_missing_in_state']} "
             f"message_sessions_without_lifecycle_current={lifecycle_stats['message_sessions_without_lifecycle_current']} "
+            f"message_sessions_without_lifecycle_reference={lifecycle_stats['message_sessions_without_lifecycle_reference']} "
             f"node_sessions_without_lifecycle_reference={lifecycle_stats['node_sessions_without_lifecycle_reference']} "
             f"state_sessions_missing_in_lcm_any={lifecycle_stats['state_sessions_missing_in_lcm_any']}"
         )

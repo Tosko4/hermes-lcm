@@ -4558,6 +4558,31 @@ class TestEngineTools:
         lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
         assert lifecycle_check["status"] == "warn"
         assert lifecycle_check["detail"]["message_sessions_without_lifecycle_current"] == 1
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_reference"] == 1
+        assert lifecycle_check["detail"]["read_only"] is True
+
+    def test_handle_doctor_does_not_warn_on_last_finalized_message_session(self, engine):
+        engine.on_session_start(
+            "current-session",
+            platform="cli",
+            context_length=200000,
+            conversation_id="conversation",
+        )
+        engine._store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+        engine._store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+        engine._lifecycle.record_rollover(
+            "conversation",
+            old_session_id="previous-session",
+            new_session_id="current-session",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "healthy"
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "pass"
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_current"] == 1
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_reference"] == 0
         assert lifecycle_check["detail"]["read_only"] is True
 
     def test_handle_doctor_warns_on_node_session_without_lifecycle_reference(self, engine):

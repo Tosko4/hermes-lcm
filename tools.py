@@ -75,7 +75,7 @@ def _has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     )
     lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
     missing_lifecycle_reference_keys = (
-        "message_sessions_without_lifecycle_current",
+        "message_sessions_without_lifecycle_reference",
         "node_sessions_without_lifecycle_reference",
     )
     return (

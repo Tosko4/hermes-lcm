@@ -352,6 +352,7 @@ class LifecycleStateStore:
         lifecycle_last_finalized_sessions = _session_ids(
             "SELECT DISTINCT last_finalized_session_id FROM lcm_lifecycle_state WHERE last_finalized_session_id IS NOT NULL"
         )
+        lifecycle_referenced_sessions = lifecycle_current_sessions | lifecycle_last_finalized_sessions
 
         stats: dict[str, Any] = {
             "read_only": True,
@@ -370,9 +371,8 @@ class LifecycleStateStore:
             "lifecycle_last_finalized_missing_in_nodes": len(lifecycle_last_finalized_sessions - node_sessions),
             "lifecycle_last_finalized_missing_in_lcm_any": len(lifecycle_last_finalized_sessions - lcm_any_sessions),
             "message_sessions_without_lifecycle_current": len(message_sessions - lifecycle_current_sessions),
-            "node_sessions_without_lifecycle_reference": len(
-                node_sessions - (lifecycle_current_sessions | lifecycle_last_finalized_sessions)
-            ),
+            "message_sessions_without_lifecycle_reference": len(message_sessions - lifecycle_referenced_sessions),
+            "node_sessions_without_lifecycle_reference": len(node_sessions - lifecycle_referenced_sessions),
             "state_db_checked": False,
             "state_db_error": "",
             "state_sessions_total": 0,

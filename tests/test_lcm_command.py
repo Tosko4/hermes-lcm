@@ -331,9 +331,32 @@ def test_lcm_doctor_warns_on_lcm_sessions_without_lifecycle_references(engine):
 
     assert "status: action-recommended" in result
     assert "message_sessions_without_lifecycle_current=1" in result
+    assert "message_sessions_without_lifecycle_reference=1" in result
     assert "node_sessions_without_lifecycle_reference=1" in result
     assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
 
+
+def test_lcm_doctor_does_not_warn_on_last_finalized_message_session(engine):
+    engine.on_session_start(
+        "current-session",
+        platform="cli",
+        context_length=200000,
+        conversation_id="conversation",
+    )
+    engine._store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+    engine._store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+    engine._lifecycle.record_rollover(
+        "conversation",
+        old_session_id="previous-session",
+        new_session_id="current-session",
+    )
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: ok" in result
+    assert "message_sessions_without_lifecycle_current=1" in result
+    assert "message_sessions_without_lifecycle_reference=0" in result
+    assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" not in result
 
 
 def test_lcm_help_on_unknown_subcommand(engine):
