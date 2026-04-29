@@ -560,7 +560,10 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
 
     session_id = engine._session_id
     if not session_id:
-        return json.dumps({"error": "No active session"})
+        return json.dumps({
+            "error": "No active session",
+            "runtime_identity": engine.get_runtime_identity(),
+        })
 
     # Store stats
     store_messages = engine._store.get_session_count(session_id)
@@ -581,6 +584,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     full_status = engine.get_status()
     lifecycle = full_status.get("lifecycle")
     source_lineage = full_status.get("source_lineage")
+    runtime_identity = full_status.get("runtime_identity")
 
     return json.dumps({
         "session_id": session_id,
@@ -627,6 +631,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "stateless": engine._session_stateless,
         },
         "source_lineage": source_lineage,
+        "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
     })
 
