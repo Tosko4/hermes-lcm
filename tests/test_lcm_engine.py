@@ -744,6 +744,30 @@ class TestEngineABC:
         assert all("Current user objective preserved" not in row["content"] for row in rows)
         assert after_restart._ingest_cursor == len(replay_with_new_message)
 
+    def test_preserved_objective_anchor_externalizes_inline_payloads(self, tmp_path):
+        db_path = tmp_path / "preserved-objective-payload.db"
+        data_uri = "data:image/png;base64," + ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" * 20)
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)), hermes_home=str(tmp_path))
+        engine.on_session_start(
+            "preserved-objective-payload-session",
+            platform="cli",
+            conversation_id="preserved-objective-payload-conversation",
+            context_length=200000,
+        )
+
+        anchor = engine._build_preserved_objective_summary_part(
+            {"role": "user", "content": "please inspect this screenshot " + data_uri}
+        )
+
+        assert "Current user objective preserved" in anchor
+        assert "data:image" not in anchor
+        match = re.search(r";\s*ref=([^;\]\s]+)", anchor)
+        assert match, anchor
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 100_000}, engine=engine))
+        assert expanded["kind"] == "ingest_payload"
+        assert expanded["content"] == data_uri
+        assert expanded["field_path"] == "preserved_objective.content"
+
     def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
         db_path = tmp_path / "restart-large.db"
         config = LCMConfig(database_path=str(db_path))
@@ -1418,6 +1442,61 @@ class TestEngineABC:
             "skipped stale no-overlap snapshot"
         )
         assert "skipped stale no-overlap snapshot" in caplog.text
+
+    def test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload(self, tmp_path):
+        db_path = tmp_path / "restart-stale-externalized-head.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            large_output_externalization_path=str(tmp_path / "externalized"),
+        )
+        before_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        before_restart.on_session_start(
+            "stale-externalized-head-session",
+            platform="cli",
+            conversation_id="stale-externalized-head-conversation",
+            context_length=200000,
+        )
+        data_uri = "data:image/png;base64," + ("A" * 5000)
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "old startup image " + data_uri},
+            {"role": "assistant", "content": "old startup answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        stored_before_restart = before_restart._store.get_session_messages(
+            "stale-externalized-head-session",
+            limit=3,
+        )
+        assert "[Externalized LCM ingest payload:" in stored_before_restart[1]["content"]
+        assert data_uri not in stored_before_restart[1]["content"]
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        after_restart.on_session_start(
+            "stale-externalized-head-session",
+            platform="cli",
+            conversation_id="stale-externalized-head-conversation",
+            context_length=200000,
+        )
+        stale_runtime_snapshot = persisted_messages[:3]
+
+        after_restart._ingest_messages(stale_runtime_snapshot)
+
+        rows = after_restart._store.get_session_messages(
+            "stale-externalized-head-session",
+            limit=len(persisted_messages) + len(stale_runtime_snapshot),
+        )
+        assert len(rows) == len(persisted_messages)
+        assert after_restart._ingest_cursor == len(stale_runtime_snapshot)
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "skipped stale no-overlap snapshot"
+        )
 
     def test_existing_session_restart_persists_one_message_no_overlap_delta(self, tmp_path):
         db_path = tmp_path / "restart-one-message-no-overlap.db"
@@ -10406,10 +10485,14 @@ class TestEngineTools:
         )
         engine_b = LCMEngine(config=config_b, hermes_home=str(shared_home))
         engine_b._session_id = "session-b"
-        store_id = engine_b._store.append(
-            "session-b",
-            {"role": "tool", "tool_call_id": "call_shared", "content": content},
+        cur = engine_b._store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("session-b", "", "tool", content, "call_shared", 0, 0, 0),
         )
+        engine_b._store._conn.commit()
+        store_id = int(cur.lastrowid)
         node_id = engine_b._dag.add_node(
             SummaryNode(
                 session_id="session-b",

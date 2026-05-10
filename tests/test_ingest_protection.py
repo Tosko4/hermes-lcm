@@ -1,0 +1,860 @@
+"""Regression tests for storage-boundary payload protection."""
+
+from __future__ import annotations
+
+import base64
+import importlib.util
+import json
+import re
+import sqlite3
+import stat
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+from hermes_lcm import tools as lcm_tools
+from hermes_lcm.command import handle_lcm_command
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+from hermes_lcm.externalize import extract_externalized_ref
+from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
+
+
+DATA_PAYLOAD = base64.b64encode(("LCM payload boundary repro ".encode("ascii")) * 900).decode("ascii")
+DATA_URI = "data:image/png;base64," + DATA_PAYLOAD
+GENERIC_BASE64 = DATA_PAYLOAD * 2
+
+
+def _engine(tmp_path: Path) -> LCMEngine:
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start(
+        "payload-session",
+        platform="telegram",
+        conversation_id="payload-conversation",
+        context_length=200_000,
+    )
+    return engine
+
+
+def _single_message_row(engine: LCMEngine, *, role: str | None = None):
+    where = "WHERE session_id = ?"
+    args = [engine.current_session_id]
+    if role:
+        where += " AND role = ?"
+        args.append(role)
+    return engine._store._conn.execute(
+        f"SELECT store_id, content, tool_calls FROM messages {where} ORDER BY store_id DESC LIMIT 1",
+        args,
+    ).fetchone()
+
+
+def _extract_ref(text: str) -> str:
+    match = re.search(r";\s*ref=([^;\]\s]+)", text)
+    assert match, text
+    return match.group(1)
+
+
+def _extract_refs(text: str) -> list[str]:
+    refs = re.findall(r";\s*ref=([^;\]\s]+)", text)
+    assert refs, text
+    return refs
+
+
+def _expand_ref(engine: LCMEngine, ref: str) -> dict:
+    return json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 100_000}, engine=engine))
+
+
+def _externalized_files(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / "externalized").glob("*.json"))
+
+
+def test_extract_externalized_ref_recovers_tool_and_non_tool_placeholders():
+    placeholders = [
+        "[Externalized tool output: tool_call_id=call_1; chars=1200; bytes=1200; ref=tool.json]",
+        "[GC'd externalized tool output: tool_call_id=call_1; chars=1200; ref=tool-gc.json]",
+        "[Externalized payload: kind=media_payload; role=user; chars=1200; bytes=1200; ref=media.json]",
+        "[GC'd externalized payload: kind=raw_payload; role=assistant; chars=1200; ref=raw-gc.json]",
+    ]
+
+    assert [extract_externalized_ref(value) for value in placeholders] == [
+        "tool.json",
+        "tool-gc.json",
+        "media.json",
+        "raw-gc.json",
+    ]
+
+
+def test_ingest_externalizes_plain_data_uri_user_content_before_sqlite_write(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "user", "content": "see image " + DATA_URI}])
+
+    store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+    assert DATA_PAYLOAD[:80] not in content
+    ref = _extract_ref(content)
+    assert _externalized_files(tmp_path)
+    assert engine._store.search("base64", session_id=engine.current_session_id) == []
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+    assert expanded["kind"] == "ingest_payload"
+
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_ref"] == ref
+    assert raw_message["externalized"]["kind"] == "ingest_payload"
+    assert raw_message["externalized"]["field_path"] == "content"
+
+
+def test_ingest_preserves_trailing_text_after_data_uri(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "user", "content": DATA_URI + " please analyze this"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+    assert content.endswith(" please analyze this")
+    assert engine._store.search("analyze", session_id=engine.current_session_id)
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+
+
+def test_ingest_externalizes_data_uri_without_media_type_before_sqlite_write(tmp_path):
+    engine = _engine(tmp_path)
+    bare_data_uri = "data:;base64," + DATA_PAYLOAD
+
+    engine._ingest_messages([{"role": "user", "content": bare_data_uri}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:;base64" not in content
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == bare_data_uri
+
+
+def test_ingest_externalizes_medium_data_uri_with_hyphenated_parameter_value(tmp_path):
+    engine = _engine(tmp_path)
+    medium_payload = base64.b64encode(b"medium-data-uri-payload" * 12).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+    data_uri = "data:image/png;charset=utf-8;base64," + medium_payload
+
+    engine._ingest_messages([{"role": "user", "content": "image " + data_uri}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "charset=utf-8" not in content
+    assert medium_payload[:120] not in content
+    assert engine._store.search("charset", session_id=engine.current_session_id) == []
+    assert engine._store.search(medium_payload[:64], session_id=engine.current_session_id) == []
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == data_uri
+
+
+def test_ingest_externalizes_structured_image_url_data_uri_before_sqlite_write(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "look at this image"},
+            {"type": "image_url", "image_url": {"url": DATA_URI}},
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "look at this image" in content
+    assert "data:image" not in content
+    ref = _extract_ref(content)
+    assert engine._store.search("look", session_id=engine.current_session_id)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+
+
+def test_ingest_externalizes_generic_long_base64_string(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "user", "content": GENERIC_BASE64}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    ref = _extract_ref(content)
+    assert len(content) < 300
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == GENERIC_BASE64
+
+
+def test_ingest_externalizes_embedded_generic_long_base64_run(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "user", "content": f"prefix {GENERIC_BASE64} suffix"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    assert content.startswith("prefix ")
+    assert content.endswith(" suffix")
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == GENERIC_BASE64
+
+
+def test_ingest_externalizes_data_uri_and_generic_base64_in_same_text(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "user", "content": f"image {DATA_URI} blob {GENERIC_BASE64} done"}])
+
+    store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+    assert DATA_PAYLOAD[:120] not in content
+    assert GENERIC_BASE64[:120] not in content
+    assert content.startswith("image ")
+    assert content.endswith(" done")
+    refs = _extract_refs(content)
+    assert len(refs) == 2
+    expanded_payloads = [_expand_ref(engine, ref)["content"] for ref in refs]
+    assert expanded_payloads == [DATA_URI, GENERIC_BASE64]
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == refs
+
+
+def test_ingest_leaves_repeated_non_base64_text_inline(tmp_path):
+    engine = _engine(tmp_path)
+    repeated_text = "A" * 8000
+
+    engine._ingest_messages([{"role": "user", "content": repeated_text}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert content == repeated_text
+    assert _externalized_files(tmp_path) == []
+
+
+def test_ingest_does_not_mutate_input_message(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "uploading"}],
+        "tool_calls": [{"function": {"name": "upload", "arguments": json.dumps({"image": DATA_URI})}}],
+    }
+    original = deepcopy(message)
+
+    engine._ingest_messages([message])
+
+    assert message == original
+
+
+def test_ingest_protection_is_idempotent_for_existing_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})
+    _store_id, placeholder, _tool_calls = _single_message_row(engine, role="user")
+    files_before = _externalized_files(tmp_path)
+
+    engine._store.append(engine.current_session_id, {"role": "user", "content": placeholder})
+
+    _store_id, second_content, _tool_calls = _single_message_row(engine, role="user")
+    assert second_content == placeholder
+    assert _externalized_files(tmp_path) == files_before
+
+
+def test_engine_ingest_does_not_double_externalize_existing_externalized_payload_placeholder(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=50,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start(
+        "double-protection-session",
+        platform="telegram",
+        conversation_id="double-protection-conversation",
+        context_length=200_000,
+    )
+    original = "see image " + DATA_URI
+
+    engine._ingest_messages([{"role": "user", "content": original}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert content.startswith("[Externalized payload: kind=media_payload;")
+    assert len(_externalized_files(tmp_path)) == 1
+    expanded = _expand_ref(engine, _extract_ref(content))
+    assert expanded["content"] == original
+
+
+def test_ingest_keeps_scanning_after_existing_placeholder_prefix(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})
+    _store_id, placeholder, _tool_calls = _single_message_row(engine, role="user")
+    first_ref = _extract_ref(placeholder)
+
+    engine._store.append(engine.current_session_id, {"role": "user", "content": f"{placeholder} plus {DATA_URI}"})
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+    assert content.startswith(placeholder)
+    assert " plus " in content
+    refs = _extract_refs(content)
+    assert len(refs) == 2
+    assert refs[0] == first_ref
+    assert refs[1] != first_ref
+    assert _expand_ref(engine, refs[0])["content"] == DATA_URI
+    assert _expand_ref(engine, refs[1])["content"] == DATA_URI
+
+
+def test_replayed_original_payload_reconciles_with_placeholder_row(tmp_path):
+    engine = _engine(tmp_path)
+    original_messages = [
+        {"role": "system", "content": "system anchor"},
+        {"role": "user", "content": "see image " + DATA_URI},
+    ]
+    engine._ingest_messages(original_messages)
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+
+
+def test_replayed_original_tool_call_payload_reconciles_with_placeholder_row(tmp_path):
+    engine = _engine(tmp_path)
+    original_messages = [
+        {"role": "system", "content": "system anchor"},
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "tool_calls": [
+                {
+                    "id": "call_upload",
+                    "type": "function",
+                    "function": {
+                        "name": "upload_image",
+                        "arguments": json.dumps({"image": DATA_URI}, indent=2),
+                    },
+                }
+            ],
+        },
+    ]
+    engine._ingest_messages(original_messages)
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+
+
+def test_tool_call_replay_identity_preserves_duplicate_key_argument_payload_text(tmp_path):
+    engine = _engine(tmp_path)
+    payload_a = "data:image/png;base64," + base64.b64encode(b"payload-a" * 48).decode("ascii")
+    payload_b = "data:image/png;base64," + base64.b64encode(b"payload-b" * 48).decode("ascii")
+    arguments_a = json.dumps({"image": payload_a}, separators=(",", ":"))[:-1] + ',"image":"plain"}'
+    arguments_b = json.dumps({"image": payload_b}, separators=(",", ":"))[:-1] + ',"image":"plain"}'
+
+    identity_a = engine._message_replay_identity(
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "tool_calls": [{"id": "call_upload", "function": {"name": "upload_image", "arguments": arguments_a}}],
+        }
+    )
+    identity_b = engine._message_replay_identity(
+        {
+            "role": "assistant",
+            "content": "calling upload",
+            "tool_calls": [{"id": "call_upload", "function": {"name": "upload_image", "arguments": arguments_b}}],
+        }
+    )
+
+    assert identity_a != identity_b
+    assert payload_a in identity_a[3]
+    assert payload_b in identity_b[3]
+
+
+def test_restart_replay_does_not_skip_changed_duplicate_key_tool_argument_payload(tmp_path):
+    payload_a = "data:image/png;base64," + base64.b64encode(b"payload-a" * 48).decode("ascii")
+    payload_b = "data:image/png;base64," + base64.b64encode(b"payload-b" * 48).decode("ascii")
+    arguments_a = json.dumps({"image": payload_a}, separators=(",", ":"))[:-1] + ',"image":"plain"}'
+    arguments_b = json.dumps({"image": payload_b}, separators=(",", ":"))[:-1] + ',"image":"plain"}'
+
+    def messages(arguments: str) -> list[dict]:
+        return [
+            {"role": "system", "content": "system anchor"},
+            {
+                "role": "assistant",
+                "content": "calling upload",
+                "tool_calls": [{"id": "call_upload", "function": {"name": "upload_image", "arguments": arguments}}],
+            },
+        ]
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(messages(arguments_a))
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(messages(arguments_b))
+
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 4
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert payload_b not in tool_calls
+    refs = extract_ingest_externalized_refs(tool_calls)
+    assert refs
+    assert _expand_ref(engine, refs[0])["content"] == payload_b
+
+
+def test_ingest_preserves_inline_payload_when_externalization_fails(tmp_path, monkeypatch):
+    from hermes_lcm import ingest_protection
+
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(ingest_protection, "externalize_ingest_payload", lambda *args, **kwargs: None)
+
+    engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert content == DATA_URI
+    assert _externalized_files(tmp_path) == []
+
+
+def test_externalized_payload_files_are_private(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})
+
+    storage_dir = tmp_path / "externalized"
+    payload_file = _externalized_files(tmp_path)[0]
+    assert stat.S_IMODE(storage_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(payload_file.stat().st_mode) == 0o600
+
+
+def test_ingest_leaves_normal_media_reference_inline(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "normal media ref"},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "file:///tmp/example.png" in content
+    assert "ref=" not in content
+    assert _externalized_files(tmp_path) == []
+
+
+def test_ingest_externalizes_tool_result_data_uri_before_sqlite_write(tmp_path):
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "tool", "tool_call_id": "call_media", "content": "tool saw " + DATA_URI}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="tool")
+    assert "data:image" not in content
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+    assert expanded["role"] == "tool"
+
+
+def test_ingest_externalizes_tool_calls_function_arguments(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "assistant",
+        "content": "calling upload",
+        "tool_calls": [
+            {
+                "id": "call_upload",
+                "type": "function",
+                "function": {
+                    "name": "upload_image",
+                    "arguments": json.dumps({"image": DATA_URI}),
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert "data:image" not in tool_calls
+    ref = _extract_ref(tool_calls)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+    parsed_tool_calls = json.loads(tool_calls)
+    parsed_args = json.loads(parsed_tool_calls[0]["function"]["arguments"])
+    assert parsed_args["image"].startswith("[Externalized LCM ingest payload:")
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == [ref]
+    assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments.image"
+    assert "tool_calls" not in raw_message
+
+
+def test_ingest_preserves_json_argument_string_when_no_payload_changes(tmp_path):
+    engine = _engine(tmp_path)
+    original_arguments = '{"b": 1, "a": 2, "b": 3}'
+    message = {
+        "role": "assistant",
+        "content": "calling ordinary function",
+        "tool_calls": [
+            {
+                "id": "call_plain",
+                "type": "function",
+                "function": {
+                    "name": "ordinary_function",
+                    "arguments": original_arguments,
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    parsed_tool_calls = json.loads(tool_calls)
+    assert parsed_tool_calls[0]["function"]["arguments"] == original_arguments
+    assert "ref=" not in tool_calls
+    assert _externalized_files(tmp_path) == []
+
+
+def test_ingest_externalizes_duplicate_key_json_argument_payload_without_collapsing_string(tmp_path):
+    engine = _engine(tmp_path)
+    original_arguments = json.dumps({"image": DATA_URI}, separators=(",", ":"))[:-1] + ',"image":"plain"}'
+    message = {
+        "role": "assistant",
+        "content": "calling duplicate-key function",
+        "tool_calls": [
+            {
+                "id": "call_duplicate",
+                "type": "function",
+                "function": {
+                    "name": "duplicate_key_function",
+                    "arguments": original_arguments,
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    parsed_tool_calls = json.loads(tool_calls)
+    protected_arguments = parsed_tool_calls[0]["function"]["arguments"]
+    assert "data:image" not in protected_arguments
+    assert ',"image":"plain"}' in protected_arguments
+    refs = extract_ingest_externalized_refs(protected_arguments)
+    assert len(refs) == 1
+    expanded = _expand_ref(engine, refs[0])
+    assert expanded["content"] == DATA_URI
+    assert expanded["field_path"] == "tool_calls[0].function.arguments"
+
+
+def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
+    engine = _engine(tmp_path)
+    tricky_key = "; ref=bogus]"
+    message = {
+        "role": "assistant",
+        "content": "calling upload",
+        "tool_calls": [
+            {
+                "id": "call_upload",
+                "type": "function",
+                "function": {
+                    "name": "upload_image",
+                    "arguments": json.dumps({tricky_key: DATA_URI}),
+                },
+            }
+        ],
+    }
+    messages = [{"role": "system", "content": "stable replay anchor"}, message]
+
+    engine._ingest_messages(messages)
+
+    store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert "data:image" not in tool_calls
+    assert tricky_key in tool_calls
+    assert "field=tool_calls-0-.function.arguments.-ref-bogus;" in tool_calls
+    refs = extract_ingest_externalized_refs(tool_calls)
+    assert len(refs) == 1
+    assert refs[0] != "bogus"
+    expanded = _expand_ref(engine, refs[0])
+    assert expanded["content"] == DATA_URI
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == refs
+    assert raw_message["externalized_payloads"][0]["field_path"] == f"tool_calls[0].function.arguments.{tricky_key}"
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    replay_engine = _engine(tmp_path)
+    replay_engine._ingest_messages(messages)
+
+    assert replay_engine._store.count_session_load_messages(replay_engine.current_session_id) == 2
+
+
+def test_ingest_externalizes_nested_json_string_tool_arguments(tmp_path):
+    engine = _engine(tmp_path)
+    nested_arguments = json.dumps({"outer": json.dumps({"inner": DATA_URI})})
+
+    engine._ingest_messages([
+        {
+            "role": "assistant",
+            "content": "calling nested upload",
+            "tool_calls": [
+                {
+                    "id": "call_nested",
+                    "type": "function",
+                    "function": {"name": "upload_nested", "arguments": nested_arguments},
+                }
+            ],
+        }
+    ])
+
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert "data:image" not in tool_calls
+    ref = _extract_ref(tool_calls)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+
+
+def _load_importer_module():
+    path = Path(__file__).resolve().parent.parent / "scripts" / "import_lossless_claw.py"
+    spec = importlib.util.spec_from_file_location("import_lossless_claw_payload_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _create_lossless_source(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE conversations (
+                conversation_id INTEGER PRIMARY KEY,
+                session_id TEXT,
+                session_key TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE messages (
+                message_id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO conversations VALUES (1, 'legacy-session', 'legacy-key', '2026-01-01 00:00')")
+        conn.execute(
+            "INSERT INTO messages VALUES (1, 1, 1, 'user', ?, 123, '2026-01-01 00:01')",
+            ("legacy " + DATA_URI,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_import_lossless_claw_externalizes_legacy_data_uri_content(tmp_path):
+    importer = _load_importer_module()
+    source_db = tmp_path / "source.db"
+    target_db = tmp_path / "target.db"
+    _create_lossless_source(source_db)
+
+    first = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="repro",
+        import_id="payload-import",
+        apply=True,
+    )
+    second = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="repro",
+        import_id="payload-import",
+        apply=True,
+    )
+
+    assert first.imported == 1
+    assert second.imported == 0
+    conn = sqlite3.connect(target_db)
+    try:
+        content = conn.execute("SELECT content FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    assert "data:image" not in content
+    ref = _extract_ref(content)
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(target_db)),
+        hermes_home=str(tmp_path),
+    )
+    engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+
+
+def test_import_lossless_claw_respects_externalization_path_env(tmp_path, monkeypatch):
+    importer = _load_importer_module()
+    source_db = tmp_path / "source.db"
+    target_db = tmp_path / "target.db"
+    custom_externalized = tmp_path / "custom-externalized"
+    _create_lossless_source(source_db)
+    monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str(custom_externalized))
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="repro",
+        import_id="payload-import-custom-path",
+        apply=True,
+    )
+
+    assert result.imported == 1
+    conn = sqlite3.connect(target_db)
+    try:
+        content = conn.execute("SELECT content FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    ref = _extract_ref(content)
+    assert (custom_externalized / ref).exists()
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(target_db), large_output_externalization_path=str(custom_externalized)),
+        hermes_home=str(tmp_path),
+    )
+    engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+
+
+def test_store_id_expand_never_returns_raw_historical_tool_calls(tmp_path):
+    engine = _engine(tmp_path)
+    tool_calls = json.dumps([{"function": {"arguments": DATA_URI}}])
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "historical row with raw tool args",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            5,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+    store_id = engine._store._conn.execute("SELECT max(store_id) FROM messages").fetchone()[0]
+
+    raw_message_text = lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine)
+    raw_message = json.loads(raw_message_text)
+
+    assert "tool_calls" not in raw_message
+    assert DATA_URI not in raw_message_text
+    assert DATA_PAYLOAD[:120] not in raw_message_text
+
+
+def test_lcm_doctor_reports_largest_and_suspicious_payload_rows(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "small content",
+            None,
+            json.dumps([{"function": {"arguments": DATA_URI}}]),
+            None,
+            1.0,
+            5,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "largest_content_rows:" in result
+    assert "largest_tool_calls_rows:" in result
+    assert "suspicious_data_uri_content_rows:" in result
+    assert "suspicious_data_uri_tool_calls_rows:" in result
+    assert "suspicious_base64_like_rows:" in result
+
+
+def test_lcm_doctor_reports_embedded_generic_base64_without_raw_preview(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "small content",
+            None,
+            json.dumps([{"function": {"arguments": "prefix " + GENERIC_BASE64 + " suffix"}}]),
+            None,
+            1.0,
+            5,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    json_result_text = lcm_tools.lcm_doctor({}, engine=engine)
+    json_result = json.loads(json_result_text)
+
+    assert GENERIC_BASE64[:120] not in json_result_text
+    payload_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
+    rows = payload_check["detail"]["suspicious_base64_like_rows"]
+    assert rows
+    assert rows[0]["field"] == "tool_calls"
+    assert rows[0]["suspicious_category"] == "base64_like"
+
+
+def test_lcm_doctor_reports_externalized_payload_stats(tmp_path):
+    engine = _engine(tmp_path)
+    engine._ingest_messages([{"role": "user", "content": DATA_URI}])
+
+    text_result = handle_lcm_command("doctor", engine)
+    json_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    assert "externalized_payload_count: 1" in text_result
+    assert "externalized_payload_bytes:" in text_result
+    externalized_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
+    assert externalized_check["detail"]["externalized_payload_count"] == 1
+    assert externalized_check["detail"]["externalized_payload_bytes"] > 0
+
+
+def test_readme_documents_storage_boundary_payload_guard():
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+
+    assert "Storage-boundary payload guard" in readme
+    assert "messages.content" in readme
+    assert "messages.tool_calls" in readme
+    assert "data:*;base64" in readme
+    assert "Doctor output is metadata-only" in readme
+    assert "state.db" in readme
+    assert "upstream/outside LCM scope" in readme
+    assert "historical rows already present in `lcm.db`" in readme
+    assert "backup-first cleanup or migration" in readme
