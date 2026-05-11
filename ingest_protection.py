@@ -75,8 +75,8 @@ _DATA_URI_BASE64_RE = re.compile(
     re.IGNORECASE,
 )
 
-_BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/=]{4096,})(?![A-Za-z0-9+/=])")
-_BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
+_BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![A-Za-z0-9+/=_-])")
+_BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
 _EXTERNALIZED_PLACEHOLDER_PREFIX = "[Externalized LCM ingest payload:"
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
@@ -152,7 +152,7 @@ def looks_like_long_base64(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CH
         return False
     if not _BASE64_ALPHABET_RE.match(text):
         return False
-    base64_chars = sum(1 for ch in text if ch.isalnum() or ch in "+/=")
+    base64_chars = sum(1 for ch in text if ch.isalnum() or ch in "+/=_-")
     ratio = base64_chars / max(1, len(text))
     if ratio < 0.98:
         return False

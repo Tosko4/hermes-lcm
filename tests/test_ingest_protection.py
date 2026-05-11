@@ -24,6 +24,7 @@ from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
 DATA_PAYLOAD = base64.b64encode(("LCM payload boundary repro ".encode("ascii")) * 900).decode("ascii")
 DATA_URI = "data:image/png;base64," + DATA_PAYLOAD
 GENERIC_BASE64 = DATA_PAYLOAD * 2
+GENERIC_BASE64URL = base64.urlsafe_b64encode(bytes(range(256)) * 40).decode("ascii")
 
 
 def _engine(tmp_path: Path) -> LCMEngine:
@@ -226,6 +227,57 @@ def test_ingest_externalizes_generic_long_base64_string(tmp_path):
     assert len(content) < 300
     expanded = _expand_ref(engine, ref)
     assert expanded["content"] == GENERIC_BASE64
+
+
+def test_ingest_externalizes_generic_long_base64url_string(tmp_path):
+    engine = _engine(tmp_path)
+    assert "-" in GENERIC_BASE64URL and "_" in GENERIC_BASE64URL
+    assert "+" not in GENERIC_BASE64URL and "/" not in GENERIC_BASE64URL
+
+    engine._ingest_messages([{"role": "user", "content": f"prefix {GENERIC_BASE64URL} suffix"}])
+
+    store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "prefix " in content
+    assert " suffix" in content
+    assert GENERIC_BASE64URL[:120] not in content
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == GENERIC_BASE64URL
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_ref"] == ref
+    assert GENERIC_BASE64URL[:120] not in json.dumps(raw_message)
+
+
+def test_ingest_externalizes_base64url_tool_call_arguments(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "assistant",
+        "content": "calling upload",
+        "tool_calls": [
+            {
+                "id": "call_upload_urlsafe",
+                "type": "function",
+                "function": {
+                    "name": "upload_blob",
+                    "arguments": json.dumps({"blob": GENERIC_BASE64URL}),
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert GENERIC_BASE64URL[:120] not in tool_calls
+    ref = _extract_ref(tool_calls)
+    parsed_tool_calls = json.loads(tool_calls)
+    parsed_args = json.loads(parsed_tool_calls[0]["function"]["arguments"])
+    assert parsed_args["blob"].startswith("[Externalized LCM ingest payload:")
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == GENERIC_BASE64URL
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == [ref]
+    assert GENERIC_BASE64URL[:120] not in json.dumps(raw_message)
 
 
 def test_ingest_externalizes_embedded_generic_long_base64_run(tmp_path):
