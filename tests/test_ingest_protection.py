@@ -16,6 +16,7 @@ from hermes_lcm import tools as lcm_tools
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
 from hermes_lcm.externalize import extract_externalized_ref
 from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
 
@@ -494,6 +495,107 @@ def test_ingest_externalizes_tool_calls_function_arguments(tmp_path):
     assert raw_message["externalized_refs"] == [ref]
     assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments.image"
     assert "tool_calls" not in raw_message
+
+
+def test_ingest_externalizes_tool_call_argument_payload_keys(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "assistant",
+        "content": "calling keyed upload",
+        "tool_calls": [
+            {
+                "id": "call_keyed_upload",
+                "type": "function",
+                "function": {
+                    "name": "upload_image",
+                    "arguments": json.dumps({DATA_URI: "plain-value"}),
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert "data:image" not in tool_calls
+    assert DATA_PAYLOAD[:80] not in tool_calls
+    ref = _extract_ref(tool_calls)
+    parsed_tool_calls = json.loads(tool_calls)
+    parsed_args = json.loads(parsed_tool_calls[0]["function"]["arguments"])
+    protected_key = next(iter(parsed_args))
+    assert protected_key.startswith("[Externalized LCM ingest payload:")
+    assert parsed_args[protected_key] == "plain-value"
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == [ref]
+    assert DATA_PAYLOAD[:80] not in json.dumps(raw_message)
+
+
+def test_ingest_externalizes_structured_content_payload_keys(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "keep this searchable"},
+            {DATA_URI: "plain-value"},
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "keep this searchable" in content
+    assert "data:image" not in content
+    assert DATA_PAYLOAD[:80] not in content
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == DATA_URI
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == [ref]
+    assert DATA_PAYLOAD[:80] not in json.dumps(raw_message)
+
+
+def test_pre_compaction_tool_arguments_sanitize_payload_keys():
+    sanitized = sanitize_pre_compaction_tool_arguments({DATA_URI: "plain-value"})
+
+    assert "data:image" not in sanitized
+    assert DATA_PAYLOAD[:80] not in sanitized
+    parsed = json.loads(sanitized)
+    assert parsed == {"[Media attachment]": "plain-value"}
+
+
+def test_payload_bearing_key_uses_neutral_child_field_path(tmp_path):
+    engine = _engine(tmp_path)
+    mixed_key = f"raw-label {DATA_URI} raw-suffix"
+    message = {
+        "role": "assistant",
+        "content": "calling keyed upload",
+        "tool_calls": [
+            {
+                "id": "call_keyed_upload",
+                "type": "function",
+                "function": {
+                    "name": "upload_image",
+                    "arguments": json.dumps({mixed_key: DATA_URI}),
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert "data:image" not in tool_calls
+    assert DATA_PAYLOAD[:80] not in tool_calls
+    payloads = [json.loads(path.read_text()) for path in _externalized_files(tmp_path)]
+    field_paths = [payload["field_path"] for payload in payloads]
+    assert len(field_paths) == 2
+    assert all("data:image" not in field_path for field_path in field_paths)
+    assert all(DATA_PAYLOAD[:80] not in field_path for field_path in field_paths)
+    assert all("raw-label" not in field_path for field_path in field_paths)
+    assert all("raw-suffix" not in field_path for field_path in field_paths)
+    assert "tool_calls[0].function.arguments.<key>" in field_paths
 
 
 def test_ingest_preserves_json_argument_string_when_no_payload_changes(tmp_path):

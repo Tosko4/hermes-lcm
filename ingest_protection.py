@@ -265,6 +265,15 @@ def _json_has_duplicate_object_keys(text: str) -> bool:
     return duplicate
 
 
+def _dict_field_path(parent: str, key: Any) -> str:
+    component = str(key)
+    return f"{parent}.{component}" if parent else component
+
+
+def _payload_key_field_path(parent: str) -> str:
+    return f"{parent}.<key>" if parent else "<key>"
+
+
 def _protect_value(
     value: Any,
     *,
@@ -276,18 +285,31 @@ def _protect_value(
     parse_json_strings: bool = False,
 ) -> Any:
     if isinstance(value, dict):
-        return {
-            key: _protect_value(
+        protected: dict[Any, Any] = {}
+        for key, val in value.items():
+            protected_key = (
+                _protect_payload_substrings(
+                    key,
+                    role=role,
+                    session_id=session_id,
+                    field_path=_payload_key_field_path(field_path),
+                    config=config,
+                    hermes_home=hermes_home,
+                )
+                if isinstance(key, str)
+                else key
+            )
+            child_path_key = "<key>" if protected_key != key else protected_key
+            protected[protected_key] = _protect_value(
                 val,
                 role=role,
                 session_id=session_id,
-                field_path=f"{field_path}.{key}" if field_path else str(key),
+                field_path=_dict_field_path(field_path, child_path_key),
                 config=config,
                 hermes_home=hermes_home,
                 parse_json_strings=parse_json_strings,
             )
-            for key, val in value.items()
-        }
+        return protected
     if isinstance(value, list):
         return [
             _protect_value(
