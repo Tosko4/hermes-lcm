@@ -10172,6 +10172,45 @@ class TestEngineTools:
         assert "ref=" in item["content"]
         assert result["pagination"]["has_more"] is False
 
+    def test_handle_expand_paginates_long_text_with_embedded_ingest_placeholder(self, engine):
+        from hermes_lcm.tokens import count_tokens
+
+        data_uri = "data:image/png;base64," + ("QUJD" * 80)
+        content = ("intro " * 140) + data_uri + (" outro" * 140)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": content},
+        )
+        stored = engine._store.get_session_messages("test-session")[-1]
+        assert "[Externalized LCM ingest payload:" in stored["content"]
+        assert "ref=" in stored["content"]
+        assert data_uri not in stored["content"]
+        assert len(stored["content"]) > 512
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Long embedded ingest marker summary",
+                token_count=10,
+                source_token_count=count_tokens(stored["content"]),
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id, "max_tokens": 20}))
+
+        item = first["expanded"][0]
+        assert item["store_id"] == store_id
+        assert item["content"] != stored["content"]
+        assert item["content_truncated"] is True
+        assert item["next_content_offset"] > 0
+        assert count_tokens(item["content"]) <= 20
+        assert first["pagination"]["has_more"] is True
+        assert first["pagination"]["next_source_offset"] == 0
+        assert first["pagination"]["next_content_offset"] == item["next_content_offset"]
+
     def test_handle_expand_paginates_oversized_message_content_without_losing_raw_tail(self, engine):
         from hermes_lcm.tokens import count_tokens
 
