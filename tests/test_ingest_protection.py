@@ -441,6 +441,97 @@ def test_replayed_original_tool_call_payload_reconciles_with_placeholder_row(tmp
     assert engine._store.count_session_load_messages(engine.current_session_id) == 2
 
 
+def test_restart_replay_matches_escaped_structured_content_payload(tmp_path):
+    medium_payload = base64.b64encode(b"medium-data-uri-payload" * 12).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+    escaped_data_uri = f"data:image\\/png;base64,{medium_payload}"
+    original_messages = [
+        {"role": "system", "content": "system anchor"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect this image"},
+                {"type": "image_url", "image_url": {"url": escaped_data_uri}},
+            ],
+        },
+    ]
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert medium_payload[:120] not in content
+    refs = extract_ingest_externalized_refs(content)
+    assert len(refs) == 1
+    assert _expand_ref(engine, refs[0])["content"] == escaped_data_uri
+    engine._store.close()
+
+    replay_engine = _engine(tmp_path)
+    replay_engine._ingest_messages(original_messages)
+
+    assert replay_engine._store.count_session_load_messages(replay_engine.current_session_id) == 2
+
+
+def test_restart_replay_matches_plain_json_string_content_payload(tmp_path):
+    medium_payload = base64.b64encode(b"plain-json-data-uri-payload" * 12).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+    escaped_data_uri = f"data:image\\/png;base64,{medium_payload}"
+    original_messages = [
+        {"role": "system", "content": "system anchor"},
+        {"role": "user", "content": f'{{"url": "{escaped_data_uri}"}}'},
+    ]
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert medium_payload[:120] not in content
+    refs = extract_ingest_externalized_refs(content)
+    assert len(refs) == 1
+    assert _expand_ref(engine, refs[0])["content"] == escaped_data_uri
+    engine._store.close()
+
+    replay_engine = _engine(tmp_path)
+    replay_engine._ingest_messages(original_messages)
+
+    assert replay_engine._store.count_session_load_messages(replay_engine.current_session_id) == 2
+
+
+def test_restart_replay_does_not_skip_changed_structured_content_payload(tmp_path):
+    payload_a = base64.b64encode(b"structured-content-a" * 16).decode("ascii")
+    payload_b = base64.b64encode(b"structured-content-b" * 16).decode("ascii")
+    assert 256 <= len(payload_a) < 4096
+    assert 256 <= len(payload_b) < 4096
+
+    def messages(payload: str) -> list[dict]:
+        escaped_data_uri = f"data:image\\/png;base64,{payload}"
+        return [
+            {"role": "system", "content": "system anchor"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect this image"},
+                    {"type": "image_url", "image_url": {"url": escaped_data_uri}},
+                ],
+            },
+        ]
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(messages(payload_a))
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    replay_engine = _engine(tmp_path)
+    replay_engine._ingest_messages(messages(payload_b))
+
+    assert replay_engine._store.count_session_load_messages(replay_engine.current_session_id) == 4
+    _store_id, content, _tool_calls = _single_message_row(replay_engine, role="user")
+    assert payload_b[:120] not in content
+    refs = extract_ingest_externalized_refs(content)
+    assert len(refs) == 1
+    assert _expand_ref(replay_engine, refs[0])["content"] == f"data:image\\/png;base64,{payload_b}"
+
+
 def test_tool_call_replay_identity_preserves_duplicate_key_argument_payload_text(tmp_path):
     engine = _engine(tmp_path)
     payload_a = "data:image/png;base64," + base64.b64encode(b"payload-a" * 48).decode("ascii")

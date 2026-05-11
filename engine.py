@@ -37,6 +37,7 @@ from .extraction import (
 )
 from .ingest_protection import (
     _json_has_duplicate_object_keys,
+    extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     restore_ingest_payload_placeholders,
@@ -2025,15 +2026,50 @@ class LCMEngine(ContextEngine):
             )
         return value
 
+    def _restore_ingest_payload_placeholders_in_content_identity(self, content: str, *, session_id: str) -> str:
+        if not content:
+            return content
+        try:
+            decoded = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return restore_ingest_payload_placeholders(
+                content,
+                config=self._config,
+                hermes_home=self._hermes_home,
+                session_id=session_id,
+            )
+        restore_as_structured = False
+        if isinstance(decoded, (dict, list)) and normalize_content_value(decoded) == content:
+            for ref in extract_ingest_externalized_refs(content):
+                payload = load_externalized_payload(
+                    ref,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                payload_session_id = (payload or {}).get("session_id") or ""
+                if session_id and payload_session_id and payload_session_id != session_id:
+                    continue
+                field_path = str((payload or {}).get("field_path") or "")
+                if field_path and field_path != "content":
+                    restore_as_structured = True
+                    break
+        if restore_as_structured:
+            restored = self._restore_ingest_payload_placeholders_in_value(decoded, session_id=session_id)
+            return normalize_content_value(restored) or ""
+        return restore_ingest_payload_placeholders(
+            content,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         content = normalize_content_value(msg.get("content")) or ""
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
-            content = restore_ingest_payload_placeholders(
+            content = self._restore_ingest_payload_placeholders_in_content_identity(
                 content,
-                config=self._config,
-                hermes_home=self._hermes_home,
                 session_id=session_id,
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
