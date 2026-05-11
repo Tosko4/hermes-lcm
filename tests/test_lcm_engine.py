@@ -5794,7 +5794,7 @@ class TestSessionRollover:
             platform="telegram",
             context_length=200000,
         )
-        a = self._start_host_child(
+        self._start_host_child(
             engine,
             hermes_home,
             "background-review-a",
@@ -8551,7 +8551,7 @@ class TestAssemblyToolPairGuardrail:
         and must include stubs for missing results."""
         import importlib
         esc_module = importlib.import_module("hermes_lcm.escalation")
-        engine_module = importlib.import_module("hermes_lcm.engine")
+        importlib.import_module("hermes_lcm.engine")
 
         config = LCMConfig(
             fresh_tail_count=4,
@@ -9835,7 +9835,7 @@ class TestEngineTools:
         assert result["results"][0]["snippet"].startswith("Keep vendoring out")
 
     def test_handle_grep_recency_same_timestamp_pool_matches_store_ordering(self, engine):
-        ids = engine._store.append_batch(
+        engine._store.append_batch(
             "test-session",
             [
                 {
@@ -10137,6 +10137,40 @@ class TestEngineTools:
             "has_more": True,
             "remaining_sources": 2,
         }
+
+    def test_handle_expand_keeps_ingest_placeholder_ref_unsliced_under_tiny_budget(self, engine):
+        data_uri = "data:image/png;base64," + ("QUJD" * 80)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "see image " + data_uri + " please inspect"},
+        )
+        stored = engine._store.get_session_messages("test-session")[-1]
+        assert "see image [Externalized LCM ingest payload:" in stored["content"]
+        assert stored["content"].endswith(" please inspect")
+        assert "ref=" in stored["content"]
+        assert data_uri not in stored["content"]
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Ingest marker recovery handle summary",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id, "max_tokens": 1}))
+
+        item = result["expanded"][0]
+        assert item["store_id"] == store_id
+        assert item["content"] == stored["content"]
+        assert item["content_truncated"] is False
+        assert item["next_content_offset"] == 0
+        assert "ref=" in item["content"]
+        assert result["pagination"]["has_more"] is False
 
     def test_handle_expand_paginates_oversized_message_content_without_losing_raw_tail(self, engine):
         from hermes_lcm.tokens import count_tokens

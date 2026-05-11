@@ -294,6 +294,7 @@ def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
         or content.startswith("[GC'd externalized tool output:")
         or content.startswith("[Externalized payload:")
         or content.startswith("[GC'd externalized payload:")
+        or "[Externalized LCM ingest payload:" in content
     )
 
 
