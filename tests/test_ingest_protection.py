@@ -17,7 +17,7 @@ from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
-from hermes_lcm.externalize import extract_externalized_ref
+from hermes_lcm.externalize import build_transcript_gc_placeholder, externalize_ingest_payload, extract_externalized_ref
 from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
 
 
@@ -77,16 +77,55 @@ def test_extract_externalized_ref_recovers_tool_and_non_tool_placeholders():
     placeholders = [
         "[Externalized tool output: tool_call_id=call_1; chars=1200; bytes=1200; ref=tool.json]",
         "[GC'd externalized tool output: tool_call_id=call_1; chars=1200; ref=tool-gc.json]",
-        "[Externalized payload: kind=media_payload; role=user; chars=1200; bytes=1200; ref=media.json]",
+        "[Externalized payload: kind=raw_payload; role=assistant; chars=1200; bytes=1200; ref=raw.json]",
         "[GC'd externalized payload: kind=raw_payload; role=assistant; chars=1200; ref=raw-gc.json]",
     ]
 
     assert [extract_externalized_ref(value) for value in placeholders] == [
         "tool.json",
         "tool-gc.json",
-        "media.json",
+        "raw.json",
         "raw-gc.json",
     ]
+
+
+def test_transcript_gc_placeholder_sanitizes_non_tool_metadata_before_ref():
+    placeholder = build_transcript_gc_placeholder(
+        {
+            "kind": "raw_payload; ref=kind-bogus]",
+            "role": "user; ref=role-bogus]",
+            "content_chars": 1200,
+            "ref": "real-ref.json",
+        }
+    )
+
+    assert "kind-bogus" in placeholder
+    assert "role-bogus" in placeholder
+    assert "; ref=kind-bogus]" not in placeholder
+    assert "; ref=role-bogus]" not in placeholder
+    assert extract_externalized_ref(placeholder) == "real-ref.json"
+
+
+def test_ingest_payload_placeholder_sanitizes_custom_kind_metadata_before_ref(tmp_path):
+    engine = _engine(tmp_path)
+    result = externalize_ingest_payload(
+        "payload content",
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+        kind="ingest_payload; ref=kind-bogus]",
+    )
+
+    assert result is not None
+    placeholder = result["placeholder"]
+    assert "kind-bogus" in placeholder
+    assert "; ref=kind-bogus]" not in placeholder
+    refs = extract_ingest_externalized_refs(placeholder)
+    assert refs == [result["path"].name]
+    assert result["path"].name.startswith("20")
+    assert "ref=kind-bogus" not in result["path"].name
 
 
 def test_ingest_externalizes_plain_data_uri_user_content_before_sqlite_write(tmp_path):

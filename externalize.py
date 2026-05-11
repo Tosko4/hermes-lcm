@@ -92,10 +92,11 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
-    kind = summary.get("kind", "tool_result") or "tool_result"
+    kind = _placeholder_metadata(summary.get("kind", "tool_result") or "tool_result")
     if kind != "tool_result":
+        role = _placeholder_metadata(summary.get("role") or "?")
         return (
-            f"[Externalized payload: kind={kind}; role={summary.get('role') or '?'}; "
+            f"[Externalized payload: kind={kind}; role={role}; "
             f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; "
             f"ref={summary.get('ref', '')}]"
         )
@@ -106,10 +107,11 @@ def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
 
 
 def build_transcript_gc_placeholder(summary: Dict[str, Any]) -> str:
-    kind = summary.get("kind", "tool_result") or "tool_result"
+    kind = _placeholder_metadata(summary.get("kind", "tool_result") or "tool_result")
     if kind != "tool_result":
+        role = _placeholder_metadata(summary.get("role") or "?")
         return (
-            f"[GC'd externalized payload: kind={kind}; role={summary.get('role') or '?'}; "
+            f"[GC'd externalized payload: kind={kind}; role={role}; "
             f"chars={summary.get('content_chars', 0)}; ref={summary.get('ref', '')}]"
         )
     return (
@@ -263,8 +265,9 @@ def externalize_ingest_payload(
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     unique_suffix = f"{time.time_ns():x}"
+    kind_stub = _safe_stub(kind, "ingest_payload")
     field_stub = re.sub(r"[^A-Za-z0-9_.-]+", "-", field_path or "payload")[:48]
-    filename = f"{timestamp}_{kind}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
+    filename = f"{timestamp}_{kind_stub}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
     path = storage_dir / filename
     payload = {
         "kind": kind,
@@ -284,7 +287,7 @@ def externalize_ingest_payload(
 
     summary = _externalized_summary(path, payload)
     placeholder = (
-        f"[Externalized LCM ingest payload: kind={summary.get('kind') or kind}; "
+        f"[Externalized LCM ingest payload: kind={_placeholder_metadata(summary.get('kind') or kind)}; "
         f"field={_placeholder_metadata(summary.get('field_path') or '?')}; chars={summary.get('content_chars', 0)}; "
         f"bytes={summary.get('content_bytes', 0)}; ref={summary.get('ref', '')}]"
     )
