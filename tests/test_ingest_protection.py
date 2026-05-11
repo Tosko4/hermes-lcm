@@ -748,6 +748,45 @@ def test_ingest_externalizes_duplicate_key_json_argument_payload_without_collaps
     assert expanded["field_path"] == "tool_calls[0].function.arguments"
 
 
+def test_ingest_externalizes_duplicate_key_json_argument_escaped_data_uri(tmp_path):
+    engine = _engine(tmp_path)
+    medium_payload = base64.b64encode(b"medium-data-uri-payload" * 12).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+    escaped_data_uri = f"data:image\\/png;base64,{medium_payload}"
+    original_arguments = f'{{"image":"{escaped_data_uri}","image":"plain"}}'
+    message = {
+        "role": "assistant",
+        "content": "calling escaped duplicate-key function",
+        "tool_calls": [
+            {
+                "id": "call_duplicate_escaped",
+                "type": "function",
+                "function": {
+                    "name": "duplicate_key_function",
+                    "arguments": original_arguments,
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    parsed_tool_calls = json.loads(tool_calls)
+    protected_arguments = parsed_tool_calls[0]["function"]["arguments"]
+    assert "data:image" not in protected_arguments
+    assert medium_payload[:120] not in protected_arguments
+    assert ',"image":"plain"}' in protected_arguments
+    refs = extract_ingest_externalized_refs(protected_arguments)
+    assert len(refs) == 1
+    expanded = _expand_ref(engine, refs[0])
+    assert expanded["content"] == escaped_data_uri
+    assert expanded["field_path"] == "tool_calls[0].function.arguments"
+    raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
+    assert raw_message["externalized_refs"] == refs
+    assert medium_payload[:120] not in json.dumps(raw_message)
+
+
 def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     engine = _engine(tmp_path)
     tricky_key = "; ref=bogus]"

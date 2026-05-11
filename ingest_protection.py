@@ -71,7 +71,7 @@ def _externalization_kind_for_message(message: Dict[str, Any]) -> str:
 # Any data URI base64 payload, not just image/audio/video. Keep the trailing
 # payload alphabet conservative so we do not slurp surrounding JSON/markdown.
 _DATA_URI_BASE64_RE = re.compile(
-    r"data:[A-Za-z0-9.+/-]*(?:;[A-Za-z0-9_.+%-]+=[-A-Za-z0-9_.+%/]+)*;base64,[A-Za-z0-9+/=]{256,}(?=$|[^A-Za-z0-9+/=])",
+    r"data:(?:[A-Za-z0-9.+-]|/|\\/)*(?:;[A-Za-z0-9_.+%-]+=(?:[-A-Za-z0-9_.+%]|/|\\/)*)*;base64,(?:[A-Za-z0-9+=]|/|\\/){256,}(?=$|[^A-Za-z0-9+/=])",
     re.IGNORECASE,
 )
 
