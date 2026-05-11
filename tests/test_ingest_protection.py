@@ -787,6 +787,45 @@ def test_ingest_externalizes_duplicate_key_json_argument_escaped_data_uri(tmp_pa
     assert medium_payload[:120] not in json.dumps(raw_message)
 
 
+def test_restart_replay_matches_escaped_duplicate_key_tool_argument_payload(tmp_path):
+    medium_payload = base64.b64encode(b"medium-data-uri-payload" * 12).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+    escaped_data_uri = f"data:image\\/png;base64,{medium_payload}"
+    original_arguments = f'{{"image":"{escaped_data_uri}","image":"plain"}}'
+    original_messages = [
+        {"role": "system", "content": "system anchor"},
+        {
+            "role": "assistant",
+            "content": "calling escaped duplicate-key function",
+            "tool_calls": [
+                {
+                    "id": "call_duplicate_escaped",
+                    "type": "function",
+                    "function": {
+                        "name": "duplicate_key_function",
+                        "arguments": original_arguments,
+                    },
+                }
+            ],
+        },
+    ]
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    engine._store.close()
+
+    engine = _engine(tmp_path)
+    engine._ingest_messages(original_messages)
+
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    assert medium_payload[:120] not in tool_calls
+    refs = extract_ingest_externalized_refs(tool_calls)
+    assert len(refs) == 1
+    assert _expand_ref(engine, refs[0])["content"] == escaped_data_uri
+
+
 def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     engine = _engine(tmp_path)
     tricky_key = "; ref=bogus]"

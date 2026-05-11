@@ -2006,9 +2006,28 @@ class LCMEngine(ContextEngine):
         except (TypeError, ValueError):
             return str(tool_calls)
 
+    def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
+        if isinstance(value, dict):
+            return {
+                self._restore_ingest_payload_placeholders_in_value(key, session_id=session_id)
+                if isinstance(key, str)
+                else key: self._restore_ingest_payload_placeholders_in_value(val, session_id=session_id)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [self._restore_ingest_payload_placeholders_in_value(item, session_id=session_id) for item in value]
+        if isinstance(value, str):
+            return restore_ingest_payload_placeholders(
+                value,
+                config=self._config,
+                hermes_home=self._hermes_home,
+                session_id=session_id,
+            )
+        return value
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         content = normalize_content_value(msg.get("content")) or ""
-        tool_calls_identity = self._stable_tool_calls_identity(msg.get("tool_calls"))
+        tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
             content = restore_ingest_payload_placeholders(
@@ -2017,12 +2036,7 @@ class LCMEngine(ContextEngine):
                 hermes_home=self._hermes_home,
                 session_id=session_id,
             )
-            tool_calls_identity = restore_ingest_payload_placeholders(
-                tool_calls_identity,
-                config=self._config,
-                hermes_home=self._hermes_home,
-                session_id=session_id,
-            )
+            tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
             ref = extract_externalized_ref(content)
             if ref:
                 payload = load_externalized_payload(
@@ -2032,6 +2046,7 @@ class LCMEngine(ContextEngine):
                 )
                 if payload is not None and isinstance(payload.get("content"), str):
                     content = payload["content"]
+        tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             str(msg.get("role") or "unknown"),
             content,
