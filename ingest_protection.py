@@ -70,8 +70,13 @@ def _externalization_kind_for_message(message: Dict[str, Any]) -> str:
 
 # Any data URI base64 payload, not just image/audio/video. Keep the trailing
 # payload alphabet conservative so we do not slurp surrounding JSON/markdown.
+# Raw scans can see JSON-escaped slashes before decoding, including both `\/`
+# and unicode escapes such as `\u002f` in duplicate-key argument strings.
+_JSON_ESCAPED_SLASH_RE = r"(?:/|\\/|\\u002[fF])"
 _DATA_URI_BASE64_RE = re.compile(
-    r"data:(?:[A-Za-z0-9.+-]|/|\\/)*(?:;[A-Za-z0-9_.+%-]+=(?:[-A-Za-z0-9_.+%]|/|\\/)*)*;base64,(?:[A-Za-z0-9+=]|/|\\/){256,}(?=$|[^A-Za-z0-9+/=])",
+    rf"data:(?:[A-Za-z0-9.+-]|{_JSON_ESCAPED_SLASH_RE})*"
+    rf"(?:;[A-Za-z0-9_.+%-]+=(?:[-A-Za-z0-9_.+%]|{_JSON_ESCAPED_SLASH_RE})*)*"
+    rf";base64,(?:[A-Za-z0-9+=]|{_JSON_ESCAPED_SLASH_RE}){{256,}}(?=$|[^A-Za-z0-9+/=])",
     re.IGNORECASE,
 )
 

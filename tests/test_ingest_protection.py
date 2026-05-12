@@ -917,6 +917,43 @@ def test_restart_replay_matches_escaped_duplicate_key_tool_argument_payload(tmp_
     assert _expand_ref(engine, refs[0])["content"] == escaped_data_uri
 
 
+def test_ingest_externalizes_unicode_escaped_slash_duplicate_key_tool_argument(tmp_path):
+    medium_payload = base64.b64encode(b"unicode-slash-data-uri-payload" * 10).decode("ascii")
+    assert 256 <= len(medium_payload) < 4096
+
+    for label, slash_escape in (("lower", "\\u002f"), ("upper", "\\u002F")):
+        variant_path = tmp_path / label
+        variant_path.mkdir()
+        engine = _engine(variant_path)
+        escaped_data_uri = "data:image" + slash_escape + "png;base64," + medium_payload
+        original_arguments = f'{{"image":"{escaped_data_uri}","image":"plain"}}'
+
+        engine._ingest_messages([
+            {
+                "role": "assistant",
+                "content": f"calling {label} unicode escaped duplicate-key function",
+                "tool_calls": [
+                    {
+                        "id": f"call_duplicate_unicode_escaped_{label}",
+                        "type": "function",
+                        "function": {
+                            "name": "duplicate_key_function",
+                            "arguments": original_arguments,
+                        },
+                    }
+                ],
+            }
+        ])
+
+        _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+        assert "data:image" not in tool_calls
+        assert slash_escape + "png" not in tool_calls
+        assert medium_payload[:120] not in tool_calls
+        refs = extract_ingest_externalized_refs(tool_calls)
+        assert len(refs) == 1
+        assert _expand_ref(engine, refs[0])["content"] == escaped_data_uri
+
+
 def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     engine = _engine(tmp_path)
     tricky_key = "; ref=bogus]"
