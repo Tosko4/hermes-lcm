@@ -675,8 +675,43 @@ def test_ingest_externalizes_tool_calls_function_arguments(tmp_path):
     assert parsed_args["image"].startswith("[Externalized LCM ingest payload:")
     raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
     assert raw_message["externalized_refs"] == [ref]
-    assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments.image"
+    assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments"
     assert "tool_calls" not in raw_message
+
+
+def test_ingest_preserves_json_argument_scaffold_when_externalizing_payload(tmp_path):
+    engine = _engine(tmp_path)
+    original_arguments = json.dumps({"image": DATA_URI, "caption": "keep formatting"}, indent=2)
+    assert "\n  \"image\": " in original_arguments
+    message = {
+        "role": "assistant",
+        "content": "calling formatted upload",
+        "tool_calls": [
+            {
+                "id": "call_formatted_upload",
+                "type": "function",
+                "function": {
+                    "name": "upload_image",
+                    "arguments": original_arguments,
+                },
+            }
+        ],
+    }
+
+    engine._ingest_messages([message])
+
+    _store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
+    parsed_tool_calls = json.loads(tool_calls)
+    protected_arguments = parsed_tool_calls[0]["function"]["arguments"]
+    assert "data:image" not in protected_arguments
+    assert DATA_PAYLOAD[:80] not in protected_arguments
+    assert protected_arguments.startswith("{\n  \"image\": \"")
+    assert protected_arguments.endswith('\",\n  \"caption\": \"keep formatting\"\n}')
+    assert ",\n  \"caption\": " in protected_arguments
+    assert json.loads(protected_arguments)["caption"] == "keep formatting"
+    refs = extract_ingest_externalized_refs(protected_arguments)
+    assert len(refs) == 1
+    assert _expand_ref(engine, refs[0])["content"] == DATA_URI
 
 
 def test_ingest_externalizes_tool_call_argument_payload_keys(tmp_path):
@@ -777,7 +812,7 @@ def test_payload_bearing_key_uses_neutral_child_field_path(tmp_path):
     assert all(DATA_PAYLOAD[:80] not in field_path for field_path in field_paths)
     assert all("raw-label" not in field_path for field_path in field_paths)
     assert all("raw-suffix" not in field_path for field_path in field_paths)
-    assert "tool_calls[0].function.arguments.<key>" in field_paths
+    assert "tool_calls[0].function.arguments" in field_paths
 
 
 def test_ingest_preserves_json_argument_string_when_no_payload_changes(tmp_path):
@@ -978,7 +1013,7 @@ def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     store_id, _content, tool_calls = _single_message_row(engine, role="assistant")
     assert "data:image" not in tool_calls
     assert tricky_key in tool_calls
-    assert "field=tool_calls-0-.function.arguments.-ref-bogus;" in tool_calls
+    assert "field=tool_calls-0-.function.arguments;" in tool_calls
     refs = extract_ingest_externalized_refs(tool_calls)
     assert len(refs) == 1
     assert refs[0] != "bogus"
@@ -986,7 +1021,7 @@ def test_ingest_ref_parser_ignores_ref_text_in_tool_argument_key(tmp_path):
     assert expanded["content"] == DATA_URI
     raw_message = json.loads(lcm_tools.lcm_expand({"store_id": store_id, "max_tokens": 100_000}, engine=engine))
     assert raw_message["externalized_refs"] == refs
-    assert raw_message["externalized_payloads"][0]["field_path"] == f"tool_calls[0].function.arguments.{tricky_key}"
+    assert raw_message["externalized_payloads"][0]["field_path"] == "tool_calls[0].function.arguments"
     assert engine._store.count_session_load_messages(engine.current_session_id) == 2
     engine._store.close()
 

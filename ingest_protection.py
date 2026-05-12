@@ -343,6 +343,18 @@ def _protect_value(
             )
         parsed = _maybe_parse_json_string(value)
         if parsed is not None:
+            canonical = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            if canonical != value:
+                raw_protected = _protect_payload_substrings(
+                    value,
+                    role=role,
+                    session_id=session_id,
+                    field_path=field_path,
+                    config=config,
+                    hermes_home=hermes_home,
+                )
+                if raw_protected != value:
+                    return raw_protected
             protected = _protect_value(
                 parsed,
                 role=role,
